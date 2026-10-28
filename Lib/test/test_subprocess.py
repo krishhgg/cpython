@@ -4066,7 +4066,7 @@ class MiscTests(unittest.TestCase):
 
     @mock.patch.object(subprocess.Popen, "_communicate")
     def _test_keyboardinterrupt_no_kill(self, popener, mock__communicate,
-                                        **kwargs):
+                                        *, kills_child=False, **kwargs):
         """Fake a SIGINT happening during Popen._communicate() and ._wait().
 
         This avoids the need to actually try and get test environments to send
@@ -4097,10 +4097,14 @@ class MiscTests(unittest.TestCase):
                 for call in mock__wait.call_args_list:
                     if call == mock.call(timeout=0.25):  # from Popen.__init__
                         sigint_calls.append(call)
-                self.assertLessEqual(mock__wait.call_count, 2,
-                                     msg=mock__wait.call_args_list)
-                self.assertEqual(len(sigint_calls), 1,
+                # One grace-period wait.  call()/run() kill the child and
+                # __exit__ adds one bounded reap.  Nothing may wait forever.
+                expected_bounded = 2 if kills_child else 1
+                self.assertEqual(len(sigint_calls), expected_bounded,
                                  msg=mock__wait.call_args_list)
+                self.assertLessEqual(mock__wait.call_count,
+                                     expected_bounded + 1,
+                                     msg=mock__wait.call_args_list)
         finally:
             # cleanup the forgotten (due to our mocks) child process
             process = self.RecordingPopen.instances_created.pop()
@@ -4109,16 +4113,83 @@ class MiscTests(unittest.TestCase):
             self.assertEqual([], self.RecordingPopen.instances_created)
 
     def test_call_keyboardinterrupt_no_kill(self):
-        self._test_keyboardinterrupt_no_kill(subprocess.call, timeout=6.282)
+        self._test_keyboardinterrupt_no_kill(
+                subprocess.call, timeout=6.282, kills_child=True)
 
     def test_run_keyboardinterrupt_no_kill(self):
-        self._test_keyboardinterrupt_no_kill(subprocess.run, timeout=6.282)
+        self._test_keyboardinterrupt_no_kill(
+                subprocess.run, timeout=6.282, kills_child=True)
 
     def test_context_manager_keyboardinterrupt_no_kill(self):
         def popen_via_context_manager(*args, **kwargs):
             with subprocess.Popen(*args, **kwargs) as unused_process:
                 raise KeyboardInterrupt  # Test how __exit__ handles ^C.
         self._test_keyboardinterrupt_no_kill(popen_via_context_manager)
+
+    def test_run_reaps_child_killed_on_keyboardinterrupt(self):
+        # gh-160787: Ctrl-C during run() waits out the grace period, then
+        # kill()s the child.  The caller never gets the Popen object.
+        # The child must be reaped or its destructor warns that it is
+        # still running.  Interrupting the first blocking wait leaves
+        # the child alive through the grace period, which is what
+        # start_new_session does for a real terminal SIGINT.
+        real_wait = subprocess.Popen._wait
+        state = {"interrupted": False, "proc": None}
+
+        def interrupt_blocking_wait(self, timeout):
+            if timeout is None and not state["interrupted"]:
+                state["interrupted"] = True
+                state["proc"] = self
+                raise KeyboardInterrupt
+            return real_wait(self, timeout)
+
+        holder = {"pid": None, "returncode": None}
+
+        def cleanup():
+            pid = holder["pid"]
+            if pid is None:
+                return
+            if mswindows:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                return
+            try:
+                waited, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if waited == 0:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
+        self.addCleanup(cleanup)
+        cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+        with mock.patch.object(subprocess.Popen, "_wait",
+                               interrupt_blocking_wait):
+            with warnings_helper.check_no_warnings(
+                    self,
+                    message=r"subprocess \d+ is still running",
+                    category=ResourceWarning,
+                    force_gc=True):
+                with self.assertRaises(KeyboardInterrupt) as cm:
+                    subprocess.run(cmd, start_new_session=True)
+                proc = state["proc"]
+                self.assertIsNotNone(proc)
+                holder["pid"] = proc.pid
+                holder["returncode"] = proc.returncode
+                cm.exception.__traceback__ = None
+                cm.exception.__context__ = None
+                cm.exception.__cause__ = None
+                del cm, proc
+                state["proc"] = None
+        self.assertIsNotNone(holder["returncode"])
 
     def test_getoutput(self):
         self.assertEqual(subprocess.getoutput('echo xyzzy'), 'xyzzy')

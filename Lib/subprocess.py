@@ -929,6 +929,10 @@ _MAXIMUM_WAIT_TIMEOUT = 24 * 3600
 _USE_POSIX_SPAWN = _use_posix_spawn()
 _HAVE_POSIX_SPAWN_CLOSEFROM = hasattr(os, 'POSIX_SPAWN_CLOSEFROM')
 
+# Same bound as the Ctrl-C grace period in Popen.__init__.  Also used
+# to reap a child that kill() has already signaled.
+_SIGINT_WAIT_SECS = 0.25  # 1/xkcd221.getRandomNumber()
+
 
 class Popen:
     """ Execute a child program in a new process.
@@ -1066,7 +1070,9 @@ class Popen:
         # How long to resume waiting on a child after the first ^C.
         # There is no right value for this.  The purpose is to be polite
         # yet remain good for interactive users trying to exit a tool.
-        self._sigint_wait_secs = 0.25  # 1/xkcd221.getRandomNumber()
+        self._sigint_wait_secs = _SIGINT_WAIT_SECS
+        # Set by kill() so __exit__ can reap a child signaled on Ctrl-C.
+        self._killed = False
 
         self._closed_child_pipe_fds = False
 
@@ -1293,12 +1299,24 @@ class Popen:
                 # If we have not already waited a brief amount of time in
                 # an interrupted .wait() or .communicate() call, do so here
                 # for consistency.
+                # call()/run() kill() the child after that grace period.
+                # Reap it when it exits promptly so __del__ does not warn
+                # that an unreaped child is still running (gh-160787).
+                # Give up if it has not exited.  SIGKILL does not take
+                # effect while the child is in uninterruptible sleep, and
+                # Ctrl-C must not hang.
                 if self._sigint_wait_secs > 0:
+                    timeout = self._sigint_wait_secs
+                elif self._killed:
+                    timeout = _SIGINT_WAIT_SECS
+                else:
+                    timeout = None
+                self._sigint_wait_secs = 0  # Note that this has been done.
+                if timeout is not None:
                     try:
-                        self._wait(timeout=self._sigint_wait_secs)
+                        self._wait(timeout=timeout)
                     except TimeoutExpired:
                         pass
-                self._sigint_wait_secs = 0  # Note that this has been done.
             else:
                 # Wait for the process to terminate, to avoid zombies.
                 self.wait()
@@ -1890,6 +1908,9 @@ class Popen:
 
         def terminate(self):
             """Terminates the process."""
+            # kill() is an alias of terminate() on Windows.  __exit__
+            # uses the flag to reap the child after Ctrl-C (gh-160787).
+            self._killed = True
             # Don't terminate a process that we know has already died.
             if self.returncode is not None:
                 return
@@ -2530,4 +2551,8 @@ class Popen:
         def kill(self):
             """Kill the process with SIGKILL
             """
+            # __exit__ uses the flag to reap the child after Ctrl-C
+            # (gh-160787).  terminate() is not flagged: SIGTERM can be
+            # caught, so a short wait would not mean the child has died.
+            self._killed = True
             self.send_signal(signal.SIGKILL)

@@ -1,0 +1,4 @@
+Fix a :exc:`ResourceWarning` from :func:`subprocess.run` and
+:func:`subprocess.call` after Ctrl-C kills a child that did not exit
+during the short grace period. The child is reaped when it exits
+promptly.
