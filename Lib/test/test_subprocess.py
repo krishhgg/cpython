@@ -4141,36 +4141,61 @@ class MiscTests(unittest.TestCase):
                 state["interrupted"] = True
                 state["proc"] = self
                 raise KeyboardInterrupt
+            # __exit__ asks for the 0.25s production bound.  Reaping a
+            # killed child can take longer on a slow machine, so the
+            # real post-kill wait uses SHORT_TIMEOUT.  The mocked tests
+            # still see the 0.25s timeout argument.
+            if self._killed:
+                timeout = support.SHORT_TIMEOUT
             return real_wait(self, timeout)
 
-        holder = {"pid": None, "returncode": None}
+        holder = {"pid": None, "returncode": None, "handle": None}
 
         def cleanup():
-            pid = holder["pid"]
-            if pid is None:
-                return
-            if mswindows:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
-                return
+            # Once returncode is set the child is reaped.  Signaling a
+            # bare PID after that can kill an unrelated process if
+            # Windows has reused the id.  A process handle names the
+            # original process.
+            handle = holder["handle"]
             try:
-                waited, _status = os.waitpid(pid, os.WNOHANG)
-            except ChildProcessError:
-                return
-            if waited == 0:
+                if holder["returncode"] is not None:
+                    return
+                if mswindows:
+                    if handle is None:
+                        return
+                    import _winapi
+                    try:
+                        _winapi.TerminateProcess(handle, 1)
+                    except OSError:
+                        pass
+                    _winapi.WaitForSingleObject(
+                            handle, int(support.SHORT_TIMEOUT * 1000))
+                    return
+                pid = holder["pid"]
+                if pid is None:
+                    return
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                try:
-                    os.waitpid(pid, 0)
+                    waited, _status = os.waitpid(pid, os.WNOHANG)
                 except ChildProcessError:
-                    pass
+                    return
+                if waited == 0:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    try:
+                        os.waitpid(pid, 0)
+                    except ChildProcessError:
+                        pass
+            finally:
+                if handle is not None:
+                    handle.Close()
 
         self.addCleanup(cleanup)
-        cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+        # Outlive SHORT_TIMEOUT so a passing test reaped a killed child.
+        sleep_secs = int(support.SHORT_TIMEOUT) + 30
+        cmd = [sys.executable, "-c",
+               f"import time; time.sleep({sleep_secs})"]
         with mock.patch.object(subprocess.Popen, "_wait",
                                interrupt_blocking_wait):
             with warnings_helper.check_no_warnings(
@@ -4182,8 +4207,11 @@ class MiscTests(unittest.TestCase):
                     subprocess.run(cmd, start_new_session=True)
                 proc = state["proc"]
                 self.assertIsNotNone(proc)
-                holder["pid"] = proc.pid
                 holder["returncode"] = proc.returncode
+                if mswindows:
+                    holder["handle"] = proc._handle
+                else:
+                    holder["pid"] = proc.pid
                 cm.exception.__traceback__ = None
                 cm.exception.__context__ = None
                 cm.exception.__cause__ = None
